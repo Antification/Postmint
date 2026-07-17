@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Postmint</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; background: #111; color: #eee; }
+    .container { max-width: 600px; margin: 0 auto; }
+    input { width: 100%; padding: 10px; margin: 10px 0; background: #222; border: 1px solid #444; color: #fff; }
+    button { padding: 10px 20px; background: #0052ff; color: #fff; border: none; cursor: pointer; }
+    button:disabled { background: #333; }
+    .status { margin-top: 20px; padding: 10px; border-radius: 4px; }
+    .error { background: #422; border: 1px solid #f44; }
+    .success { background: #242; border: 1px solid #4f4; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Postmint</h2>
+    <p>Mint any X/Twitter post as an NFT on Base.</p>
+    <input type="text" id="tweetUrl" placeholder="https://x.com/username/status/123..." />
+    <button id="mintBtn">Mint NFT</button>
+    <div id="status" class="status" style="display:none;"></div>
+  </div>
+  <script>
+    const btn = document.getElementById('mintBtn');
+    const status = document.getElementById('status');
+    const input = document.getElementById('tweetUrl');
+
+    bankr.on('ready', () => {
+      btn.onclick = async () => {
+        const url = input.value.trim();
+        if (!url) return;
+        
+        btn.disabled = true;
+        status.style.display = 'block';
+        status.className = 'status';
+        status.innerText = 'Processing...';
+
+        try {
+          const result = await bankr.invokeScript('mint', { url });
+          if (result.error) throw new Error(result.error);
+          
+          status.className = 'status success';
+          status.innerHTML = `Successfully minted! <br/> <a href="${result.txUrl}" target="_blank" style="color:#4f4">View Transaction</a>`;
+          bankr.prefillChat(`I just minted this tweet: ${url}`);
+        } catch (err) {
+          status.className = 'status error';
+          status.innerText = err.message;
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    });
+  </script>
+</body>
+</html>
