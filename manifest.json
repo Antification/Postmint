@@ -1,0 +1,14 @@
+{
+  "slug": "postmint-minter",
+  "title": "Postmint Minter",
+  "description": "Mint any X/Twitter post as an NFT on Base. Each user gets their own deterministic collection.",
+  "permissions": [
+    "read:portfolio",
+    "write:appdata",
+    "read:appdata",
+    "invoke:agent"
+  ],
+  "scripts": [
+    "mint"
+  ]
+}
