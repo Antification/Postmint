@@ -45,6 +45,7 @@ description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE 
 > **C) Lost the race (tx REVERTED on submit):** if you were on path A (`alreadyMinted: false`) and the submitted `mintPost` tx REVERTS ("post already minted" / execution reverted), you LOST a first-come-first-served race — someone confirmed the same post between the dedup read and your submit. This is EXPECTED, not an error. Do NOT surface the raw revert to the user. Instead run the post-revert resolver (Step 2b) to fetch the winning minter + token, then reply with the SAME path-B style message:
 > - "looks like this post just got minted by <minter> a moment before you — grab it on secondary: <openseaToken>"
 > The opensea.io link is allowed here for the same reason as path B. NEVER show "transaction reverted" / "mint failed" as the final message for a duplicate — always resolve to the winner and give the secondary link.
+> **BUT FIRST check for truncation:** if the signer error shows `dataBytes` far smaller than the build script's `dataLen / 2`, the calldata was truncated in transit — that is NOT a race. See Step 2's CALLDATA INTEGRITY rule and the troubleshooting entry for `simulation_reverted`.
 
 Mint any public post/tweet as an ERC-1155 NFT on Base, into ONE shared "Postmint" collection at `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. The NFT is held by the minter. Metadata is fully on-chain (base64 data URI) — no servers, no IPFS pinning. Every post can be minted once (first-come-first-served, enforced on-chain).
 
@@ -78,7 +79,7 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
    - If the tweet has a **photo**, use it as `image`.
    - If the tweet has a **gif or video** (no photo), use the media's `thumbnail_url` (poster frame) as `image` AND set `animation_url` to the best mp4 variant so marketplaces play the motion. (Twitter "gifs" are mp4 videos — same handling.)
    - If the tweet itself has no usable media but **quotes a tweet that does**, use the quoted tweet's photo, or its gif/video poster + mp4.
-   - If NO media is found anywhere (**text-only post**), the script RENDERS a tight tweet-card as an **SVG built from a string** (no headless browser) — sender avatar (embedded as a base64 data URI) + display name + @handle + the tweet text word-wrapped, and the date. The SVG is a fixed 600px wide and its HEIGHT is computed from the wrapped line count, so the card auto-fits any tweet length — no whitespace padding on short tweets, no chopped lines on long ones. It's embedded fully on-chain as a `data:image/svg+xml;base64` URI (no external image host, nothing to rot). This REPLACES the old thum.io screenshot, which captured the whole page and often baked in an `image/gif` loading placeholder.
+   - If NO media is found anywhere (**text-only post**), the script RENDERS a tight tweet-card as an **SVG built from a string** (no headless browser) — sender avatar (embedded as a base64 data URI, tiny `_mini` variant to keep calldata small) + display name + @handle + the tweet text word-wrapped, and the date. The SVG is a fixed 600px wide and its HEIGHT is computed from the wrapped line count, so the card auto-fits any tweet length — no whitespace padding on short tweets, no chopped lines on long ones. It's embedded fully on-chain as a `data:image/svg+xml;base64` URI (no external image host, nothing to rot). This REPLACES the old thum.io screenshot, which captured the whole page and often baked in an `image/gif` loading placeholder.
 5. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved photo / poster / on-chain SVG card, `animation_url` = mp4 (only when a gif/video was found), external_url = tweet URL.
 6. Builds a single `mintPost(postId, tokenURI)` transaction to the shared contract `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. `postId` = the target tweet's status ID. The NFT is minted to `msg.sender` (the tweeting user).
 7. After the mint confirms, report per OUTPUT CONTRACT path A (Basescan token link + tx + Bankr-terminal note).
@@ -96,7 +97,7 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 Run this script with `execute_cli` (packages: `["viem@2.21.0"]`, run with `bun build-mint.js`). Set `WALLET` and ONE of `TWEET_URL` / `REPLY_ID` via env. It prints either an `alreadyMinted:true` result (path B) or a JSON transaction to submit plus the links to report (path A).
 
 ```javascript
-// build-mint.js — Postmint v5 (shared contract; on-chain SVG card for text-only posts)
+// build-mint.js — Postmint v6 (shared contract; on-chain SVG card for text-only posts; mini avatar keeps calldata submit-safe)
 import { createPublicClient, http, encodeFunctionData } from 'viem';
 import { base } from 'viem/chains';
 
@@ -157,15 +158,26 @@ function resolveMedia(all) {
 // and embedded as a base64 data URI so the whole card lives on-chain with zero external dependencies.
 const xmlEsc = (s) => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 async function avatarDataUri(url) {
-  try {
-    if (!url) return null;
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const ct = r.headers.get('content-type') || 'image/jpeg';
-    const b = Buffer.from(await r.arrayBuffer());
-    if (b.length > 400000) return null; // keep tokenURI reasonable; fall back to placeholder circle
-    return `data:${ct};base64,${b.toString('base64')}`;
-  } catch { return null; }
+  // CALLDATA SIZE MATTERS: the whole SVG card rides inside the tx calldata. A 200x200 avatar
+  // (~7.5KB) alone adds ~20KB of hex; total calldata hit ~40KB and was getting TRUNCATED between
+  // build and submit, causing simulation_reverted failures. The card renders the avatar at 56px,
+  // so the tiny `_mini` (48x48) variant looks identical and keeps calldata ~5-12KB total.
+  const candidates = [];
+  if (url) {
+    candidates.push(url.replace(/_(?:bigger|normal|200x200|400x400)\.(jpg|jpeg|png|webp)/i, '_mini.$1'));
+    candidates.push(url); // fallback if the _mini variant 404s
+  }
+  for (const u of candidates) {
+    try {
+      const r = await fetch(u);
+      if (!r.ok) continue;
+      const ct = r.headers.get('content-type') || 'image/jpeg';
+      const b = Buffer.from(await r.arrayBuffer());
+      if (b.length > 8000) continue; // hard cap — avatar must stay tiny to keep the tx submit-safe
+      return `data:${ct};base64,${b.toString('base64')}`;
+    } catch {}
+  }
+  return null; // placeholder circle is drawn instead
 }
 // Greedy word-wrap by approx chars-per-line for the given width/font-size. Preserves hard newlines.
 function wrapText(text, maxChars) {
@@ -290,6 +302,7 @@ const data = encodeFunctionData({ abi, functionName: 'mintPost', args: [String(s
 console.log(JSON.stringify({
   alreadyMinted: false,
   tx: { chain: 'base', to: CONTRACT, data, value: '0' },
+  dataLen: data.length, // hex chars incl. 0x — the submitted data string MUST be exactly this long
   expectedTokenId: nextId.toString(),
   statusId,
   resolvedFrom,
@@ -305,9 +318,15 @@ If the script output has `alreadyMinted: true`, DO NOT submit anything — go to
 
 Otherwise take the `tx` object and submit it with `submit_raw_transaction` ({ to, data, value, chain: "base" }). The `msg.sender` MUST be the tweeting user's wallet (the wallet passed as `WALLET`) — that wallet becomes the on-chain minter and holder of the NFT.
 
+> **CALLDATA INTEGRITY — MANDATORY:** `tx.data` is ONE long hex string (typically 5,000–15,000 chars for text-only mints, since the whole SVG card rides inside it). It MUST reach `submit_raw_transaction` byte-exact and IN FULL:
+> - Pass the COMPLETE `tx.data` string from the build output directly into the tool call. Never re-type it, never abbreviate it, never reconstruct it from memory, never splice fragments.
+> - Verify length: the data string you submit must be exactly `dataLen` characters (the build output includes `dataLen`). The signer's error/receipt reports `dataBytes` — a healthy submit has `dataBytes ≈ (dataLen - 2) / 2`.
+> - **Truncation signature:** if the signer rejects with `simulation_reverted` and its reported `dataBytes` is MUCH smaller than `(dataLen - 2) / 2` (e.g. `dataBytes: 512` when `dataLen` is 11210 → ~5604 bytes expected), the calldata got CUT OFF in transit. The contract received malformed ABI input — this revert has NOTHING to do with the post being already minted. Do NOT retry the same paste and do NOT run the path-C resolver first. Re-run build-mint.js and submit the fresh, complete string.
+> - If the same truncation happens twice, submit in the SAME turn the build ran (fresh output → straight into the tool call) rather than carrying the hex across steps.
+
 ### Step 2b — If the submit REVERTS, resolve the winner (path C)
 
-If `submit_raw_transaction` reverts ("post already minted" / execution reverted) on the path-A mint, you lost the race. Do NOT report a failure. Re-read the contract to find who won, then use OUTPUT CONTRACT path C. Run with `execute_cli` (packages `["viem@2.21.0"]`, `bun resolve-winner.js`), passing `STATUS_ID` (the `statusId` from the build-script output):
+If `submit_raw_transaction` reverts ("post already minted" / execution reverted / `simulation_reverted` with a FULL-LENGTH `dataBytes`) on the path-A mint, you likely lost the race. FIRST rule out truncation (compare `dataBytes` to `dataLen / 2` — see Step 2). If the calldata was full-length, re-read the contract to find who won, then use OUTPUT CONTRACT path C. Run with `execute_cli` (packages `["viem@2.21.0"]`, `bun resolve-winner.js`), passing `STATUS_ID` (the `statusId` from the build-script output):
 
 ```javascript
 // resolve-winner.js — who minted this post (for path C after a reverted submit)
@@ -323,12 +342,12 @@ async function readC(fn, args=[]) { let e; for (const u of RPCS) { try { const c
 const statusId = String(process.env.STATUS_ID || '').trim();
 if (!statusId) throw new Error('Provide STATUS_ID');
 const id = await readC('tokenIdForPost', [statusId]);
-if (!id || id === 0n) { console.log(JSON.stringify({ resolved:false, note:'not minted yet — the revert was NOT a duplicate; investigate (gas/RPC/other).' }, null, 2)); process.exit(0); }
+if (!id || id === 0n) { console.log(JSON.stringify({ resolved:false, note:'not minted yet — the revert was NOT a duplicate; check for truncated calldata (dataBytes vs dataLen/2), then gas/RPC.' }, null, 2)); process.exit(0); }
 const minter = await readC('minterOf', [id]);
 console.log(JSON.stringify({ resolved:true, statusId, tokenId:id.toString(), minter, openseaToken:`https://opensea.io/assets/base/${CONTRACT}/${id}`, openseaCollection:`https://opensea.io/assets/base/${CONTRACT}` }, null, 2));
 ```
 
-If `resolved: true`, reply with path C using `minter` + `openseaToken`. If `resolved: false`, the revert was NOT a duplicate (e.g. gas / RPC) — report the real error and offer to retry.
+If `resolved: true`, reply with path C using `minter` + `openseaToken`. If `resolved: false`, the revert was NOT a duplicate — the most common cause is TRUNCATED CALLDATA (see Step 2's integrity rule); rebuild and resubmit the full string before considering gas/RPC issues.
 
 ### Step 3 — Report to the user
 
@@ -360,25 +379,27 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **One shared collection for everyone.** All mints go to `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. There is no per-user collection anymore. Do NOT deploy anything — the contract already exists on Base.
 - **First-come-first-served is real and on-chain.** Each post can be minted once. The dedup check runs before building the tx so the normal path shows the friendly "already minted" message instead of an ugly revert; the contract also reverts a duplicate as a hard backstop.
 - **Race window (why the "loser" of a double mint used to see a raw revert):** the dedup read and the submit are two steps. Two mints of the same post in that gap both pass the read; the second tx reverts on-chain. The build script now RE-READS `tokenIdForPost` immediately before returning the tx (shrinking the window), and if the submit still reverts, Step 2b + path C resolve the winner and show the friendly secondary-link message instead of the raw revert. Same-block collisions are still possible — path C is the catch-all that makes the loser experience correct.
+- **Calldata is big on text-only mints — treat it carefully.** The on-chain SVG card lives inside the tx calldata, so text-only mints run 5,000–15,000 hex chars. The `_mini` avatar variant keeps this well under the size that was previously getting truncated (a 200x200 avatar pushed calldata to ~40KB of hex and submits started failing with `simulation_reverted` from cut-off data). Always verify the submitted data length equals the build output's `dataLen`.
 - **The NFT is held by the minter.** `mintPost` mints to `msg.sender` — the tweeting user's own wallet. The collection contract is shared; token ownership is theirs.
 - **Reply & quote context first.** "mint this for me" as a reply means mint the PARENT; as a quote tweet means mint the QUOTED tweet. Pass the user's own tweet ID as `REPLY_ID`; the script follows `replying_to_status` (reply) then `quote.id` (QT). Only ask for a URL if there is genuinely no resolvable target.
 - **Do not change the collection name/description strings** ("Postmint" / "Posts minted via Bankr") — they are set on-chain by the contract owner, not per mint. The build script no longer sets collection metadata.
 - **The tweet must be public.** Protected/deleted tweets (including an unavailable PARENT or QUOTED tweet) fail at the fxtwitter step with a clear error.
 - **GIF & video ARE supported.** For a gif/video post, the NFT's `image` is the poster frame (thumbnail) and `animation_url` is the best mp4 variant, so OpenSea and most marketplaces play the motion while using the poster as the thumbnail. The mp4 stays hosted on Twitter's CDN — if that link ever rots, motion stops but the on-chain poster image and metadata survive. Embedding the video bytes on-chain is intentionally NOT done (far too large/expensive). Videos with no resolvable poster fall back to the on-chain SVG tweet-card. The first/primary media item is used when a post has several.
-- **Text-only posts render a tight on-chain SVG tweet-card.** No media anywhere → the script builds an SVG card (600px wide, height auto-computed from the wrapped line count) containing the sender avatar (embedded base64 data URI), display name, @handle, the word-wrapped tweet text, and the date, and embeds it as a `data:image/svg+xml;base64` URI. This is FULLY on-chain — no external image host, nothing to rot — and it frames just the tweet, so short tweets have no whitespace padding and long tweets are never chopped. Verified: renders to a valid raster (600×204 for a short tweet, taller as text grows) and includes the avatar. This REPLACED the old thum.io screenshot fallback, which captured the whole x.com page and frequently baked in an `image/gif` loading-placeholder (a dead image). If the avatar can't be fetched (or is >400KB), the card draws a neutral placeholder circle instead — the text card still renders.
+- **Text-only posts render a tight on-chain SVG tweet-card.** No media anywhere → the script builds an SVG card (600px wide, height auto-computed from the wrapped line count) containing the sender avatar (embedded base64 data URI, `_mini` 48x48 variant — rendered at 56px so quality is indistinguishable while keeping calldata small), display name, @handle, the word-wrapped tweet text, and the date, and embeds it as a `data:image/svg+xml;base64` URI. This is FULLY on-chain — no external image host, nothing to rot — and it frames just the tweet, so short tweets have no whitespace padding and long tweets are never chopped. Verified: renders to a valid raster (600×204 for a short tweet, taller as text grows) and includes the avatar. This REPLACED the old thum.io screenshot fallback, which captured the whole x.com page and frequently baked in an `image/gif` loading-placeholder (a dead image). If the avatar can't be fetched (or exceeds the 8KB embed cap), the card draws a neutral placeholder circle instead — the text card still renders.
 - **Royalties:** 5% ERC-2981 to the collection owner, set on-chain. Not something the skill or minter controls per token.
 
 ## Troubleshooting
 
 - **Script emits `alreadyMinted: true`:** expected when the post was already minted. Do NOT submit a tx (it reverts). Use OUTPUT CONTRACT path B (minter + OpenSea token link).
-- **Tx reverts with "post already minted":** you lost a first-come-first-served race (someone confirmed the same post between the dedup read and your submit). This is EXPECTED. Do NOT show the raw revert. Run Step 2b (`resolve-winner.js`) and reply with OUTPUT CONTRACT **path C** — the winning minter + OpenSea token link. Only if `resolve-winner.js` returns `resolved:false` is the revert a genuine (non-duplicate) failure worth surfacing.
+- **`simulation_reverted` from the signer on a fresh mint — CHECK `dataBytes` FIRST:** compare the signer error's `dataBytes` to the build output's `dataLen`. Healthy = `dataBytes ≈ (dataLen - 2) / 2`. (1) `dataBytes` FAR SMALLER (e.g. `dataBytes: 512` when the build emitted `dataLen: 11210` → ~5,604 bytes expected) → the calldata was TRUNCATED between build and submit; the contract got malformed ABI input. NOT a race, NOT already-minted. Re-run build-mint.js and pass the complete fresh `tx.data` straight into `submit_raw_transaction` in the same turn. (2) `dataBytes` matches → treat as a lost race: run Step 2b (`resolve-winner.js`) and reply path C. Never surface the raw signer error to the user without doing this diagnosis.
+- **Tx reverts with "post already minted":** you lost a first-come-first-served race (someone confirmed the same post between the dedup read and your submit). This is EXPECTED. Do NOT show the raw revert. Run Step 2b (`resolve-winner.js`) and reply with OUTPUT CONTRACT **path C** — the winning minter + OpenSea token link. Only if `resolve-winner.js` returns `resolved:false` is the revert a genuine (non-duplicate) failure — then the prime suspect is truncated calldata (see the entry above).
 - **Agent asks "which post?" when the user was replying to / quoting a tweet:** the agent didn't pass `REPLY_ID`. Hand the build script the user's OWN tweet ID as `REPLY_ID`; it resolves `replying_to_status` (reply) or `quote.id` (QT).
 - **`That tweet is neither a reply nor a quote tweet`:** `REPLY_ID` pointed at a top-level tweet. Ask for the target URL.
 - **`parent/quoted may be protected/deleted`:** the target tweet is unavailable via fxtwitter. Nothing to mint; tell the user the original post isn't publicly accessible.
 - **GIF/video NFT shows only a still, no motion:** the marketplace doesn't render `animation_url`, or the mp4 CDN link expired. The poster `image` always renders; motion depends on the marketplace + a live Twitter CDN mp4. Nothing to fix on-chain — metadata is immutable.
 - **GIF/video NFT has no image at all:** the media had no resolvable `thumbnail_url`/poster; the script then falls back to the on-chain SVG tweet-card. If you see a blank, re-run — a transient fxtwitter response may have lacked the poster field.
 - **Text-only NFT image looks like a full-screen screenshot / has whitespace or a blank loading gif:** that is the OLD thum.io behavior. The current script renders an on-chain SVG tweet-card instead (tight crop, avatar included, auto-fit height). If you still see a screenshot-style image on a NEW mint, the agent is running an outdated build-mint.js — use the version in this SKILL.md. Already-minted tokens can't be changed (metadata is immutable on-chain base64 and the contract has no per-token setURI); this only affects mints going forward.
-- **Text-only SVG card is missing the avatar (shows a plain circle):** the avatar fetch failed or the image exceeded the 400KB embed cap, so the card drew a placeholder circle. The text, name, handle, and date still render. Re-run to retry the avatar fetch if a transient failure is suspected.
+- **Text-only SVG card is missing the avatar (shows a plain circle):** the avatar fetch failed (both the `_mini` variant and the original URL), or the image exceeded the 8KB embed cap. The text, name, handle, and date still render. Re-run to retry the avatar fetch if a transient failure is suspected.
 - **Text-only SVG card text looks cramped or overflows the card width:** the greedy word-wrap uses an empirical avg glyph width (`fontSize * 0.52`) to pick chars-per-line. Very wide glyphs can nudge a line slightly; it does not chop text (height grows to fit). If you want a safer margin, lower the `0.52` factor in `wrapText`'s `maxChars` calc.
 - **Response shows Zora / wrong links on a fresh mint:** the agent ignored OUTPUT CONTRACT path A. Report ONLY the Basescan token link + basescan tx + the Bankr-terminal note.
 - **"skill installed but errored loading" → fell back to Club-gated search:** RETRY loading the skill directly (`use_skill`/`use_skill_file`) and act on the trigger. Never route through `search_skills` (Club-gated).
