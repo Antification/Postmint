@@ -41,6 +41,10 @@ description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE 
 > - "this post was already minted by <minter> — grab it on secondary: <openseaToken>"
 > - If only the collection link is available, use `<openseaCollection>` instead.
 > The `opensea.io` link is ALLOWED and expected ONLY on this already-minted path. It is the one deliberate exception to the no-OpenSea rule.
+>
+> **C) Lost the race (tx REVERTED on submit):** if you were on path A (`alreadyMinted: false`) and the submitted `mintPost` tx REVERTS ("post already minted" / execution reverted), you LOST a first-come-first-served race — someone confirmed the same post between the dedup read and your submit. This is EXPECTED, not an error. Do NOT surface the raw revert to the user. Instead run the post-revert resolver (Step 2b) to fetch the winning minter + token, then reply with the SAME path-B style message:
+> - "looks like this post just got minted by <minter> a moment before you — grab it on secondary: <openseaToken>"
+> The opensea.io link is allowed here for the same reason as path B. NEVER show "transaction reverted" / "mint failed" as the final message for a duplicate — always resolve to the winner and give the secondary link.
 
 Mint any public post/tweet as an ERC-1155 NFT on Base, into ONE shared "Postmint" collection at `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. The NFT is held by the minter. Metadata is fully on-chain (base64 data URI) — no servers, no IPFS pinning. Every post can be minted once (first-come-first-served, enforced on-chain).
 
@@ -92,7 +96,7 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 Run this script with `execute_cli` (packages: `["viem@2.21.0"]`, run with `bun build-mint.js`). Set `WALLET` and ONE of `TWEET_URL` / `REPLY_ID` via env. It prints either an `alreadyMinted:true` result (path B) or a JSON transaction to submit plus the links to report (path A).
 
 ```javascript
-// build-mint.js — Postmint v2 (shared contract)
+// build-mint.js — Postmint v4 (shared contract)
 import { createPublicClient, http, encodeFunctionData } from 'viem';
 import { base } from 'viem/chains';
 
@@ -205,6 +209,19 @@ const tokenMeta = { name: `Post by @${author}`, description: `${t.text || ''}\n\
 if (animationUrl) tokenMeta.animation_url = animationUrl; // motion for gif/video; poster stays as `image`
 const tokenUri = dataUri(tokenMeta);
 
+// --- RE-CHECK right before building the tx (shrinks the race window) ---
+const reCheck = await readC('tokenIdForPost', [String(statusId)]);
+if (reCheck && reCheck > 0n) {
+  const rMinter = await readC('minterOf', [reCheck]);
+  console.log(JSON.stringify({
+    alreadyMinted: true, statusId, tokenId: reCheck.toString(), minter: rMinter,
+    openseaToken: `https://opensea.io/assets/base/${CONTRACT}/${reCheck}`,
+    openseaCollection: `https://opensea.io/assets/base/${CONTRACT}`,
+    resolvedFrom, raced: true,
+  }, null, 2));
+  process.exit(0);
+}
+
 const nextId = await readC('nextTokenId');
 const data = encodeFunctionData({ abi, functionName: 'mintPost', args: [String(statusId), tokenUri] });
 
@@ -225,6 +242,31 @@ console.log(JSON.stringify({
 If the script output has `alreadyMinted: true`, DO NOT submit anything — go to Step 3 path B.
 
 Otherwise take the `tx` object and submit it with `submit_raw_transaction` ({ to, data, value, chain: "base" }). The `msg.sender` MUST be the tweeting user's wallet (the wallet passed as `WALLET`) — that wallet becomes the on-chain minter and holder of the NFT.
+
+### Step 2b — If the submit REVERTS, resolve the winner (path C)
+
+If `submit_raw_transaction` reverts ("post already minted" / execution reverted) on the path-A mint, you lost the race. Do NOT report a failure. Re-read the contract to find who won, then use OUTPUT CONTRACT path C. Run with `execute_cli` (packages `["viem@2.21.0"]`, `bun resolve-winner.js`), passing `STATUS_ID` (the `statusId` from the build-script output):
+
+```javascript
+// resolve-winner.js — who minted this post (for path C after a reverted submit)
+import { createPublicClient, http } from 'viem';
+import { base } from 'viem/chains';
+const CONTRACT = '0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1';
+const RPCS = ['https://mainnet.base.org','https://base.llamarpc.com','https://base-rpc.publicnode.com'];
+const abi = [
+  { type:'function', name:'tokenIdForPost', stateMutability:'view', inputs:[{type:'string'}], outputs:[{type:'uint256'}] },
+  { type:'function', name:'minterOf', stateMutability:'view', inputs:[{type:'uint256'}], outputs:[{type:'address'}] },
+];
+async function readC(fn, args=[]) { let e; for (const u of RPCS) { try { const c = createPublicClient({ chain: base, transport: http(u) }); return await c.readContract({ address: CONTRACT, abi, functionName: fn, args }); } catch (x) { e = x; } } throw e; }
+const statusId = String(process.env.STATUS_ID || '').trim();
+if (!statusId) throw new Error('Provide STATUS_ID');
+const id = await readC('tokenIdForPost', [statusId]);
+if (!id || id === 0n) { console.log(JSON.stringify({ resolved:false, note:'not minted yet — the revert was NOT a duplicate; investigate (gas/RPC/other).' }, null, 2)); process.exit(0); }
+const minter = await readC('minterOf', [id]);
+console.log(JSON.stringify({ resolved:true, statusId, tokenId:id.toString(), minter, openseaToken:`https://opensea.io/assets/base/${CONTRACT}/${id}`, openseaCollection:`https://opensea.io/assets/base/${CONTRACT}` }, null, 2));
+```
+
+If `resolved: true`, reply with path C using `minter` + `openseaToken`. If `resolved: false`, the revert was NOT a duplicate (e.g. gas / RPC) — report the real error and offer to retry.
 
 ### Step 3 — Report to the user
 
@@ -255,6 +297,7 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 
 - **One shared collection for everyone.** All mints go to `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. There is no per-user collection anymore. Do NOT deploy anything — the contract already exists on Base.
 - **First-come-first-served is real and on-chain.** Each post can be minted once. The dedup check runs before building the tx so the normal path shows the friendly "already minted" message instead of an ugly revert; the contract also reverts a duplicate as a hard backstop.
+- **Race window (why the "loser" of a double mint used to see a raw revert):** the dedup read and the submit are two steps. Two mints of the same post in that gap both pass the read; the second tx reverts on-chain. The build script now RE-READS `tokenIdForPost` immediately before returning the tx (shrinking the window), and if the submit still reverts, Step 2b + path C resolve the winner and show the friendly secondary-link message instead of the raw revert. Same-block collisions are still possible — path C is the catch-all that makes the loser experience correct.
 - **The NFT is held by the minter.** `mintPost` mints to `msg.sender` — the tweeting user's own wallet. The collection contract is shared; token ownership is theirs.
 - **Reply & quote context first.** "mint this for me" as a reply means mint the PARENT; as a quote tweet means mint the QUOTED tweet. Pass the user's own tweet ID as `REPLY_ID`; the script follows `replying_to_status` (reply) then `quote.id` (QT). Only ask for a URL if there is genuinely no resolvable target.
 - **Do not change the collection name/description strings** ("Postmint" / "Posts minted via Bankr") — they are set on-chain by the contract owner, not per mint. The build script no longer sets collection metadata.
@@ -266,7 +309,7 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 ## Troubleshooting
 
 - **Script emits `alreadyMinted: true`:** expected when the post was already minted. Do NOT submit a tx (it reverts). Use OUTPUT CONTRACT path B (minter + OpenSea token link).
-- **Tx reverts with "post already minted":** the dedup check was skipped or a race occurred (two mints of the same post within seconds — first wins). Re-run the build script; it will now return `alreadyMinted: true` with the winner's token/minter.
+- **Tx reverts with "post already minted":** you lost a first-come-first-served race (someone confirmed the same post between the dedup read and your submit). This is EXPECTED. Do NOT show the raw revert. Run Step 2b (`resolve-winner.js`) and reply with OUTPUT CONTRACT **path C** — the winning minter + OpenSea token link. Only if `resolve-winner.js` returns `resolved:false` is the revert a genuine (non-duplicate) failure worth surfacing.
 - **Agent asks "which post?" when the user was replying to / quoting a tweet:** the agent didn't pass `REPLY_ID`. Hand the build script the user's OWN tweet ID as `REPLY_ID`; it resolves `replying_to_status` (reply) or `quote.id` (QT).
 - **`That tweet is neither a reply nor a quote tweet`:** `REPLY_ID` pointed at a top-level tweet. Ask for the target URL.
 - **`parent/quoted may be protected/deleted`:** the target tweet is unavailable via fxtwitter. Nothing to mint; tell the user the original post isn't publicly accessible.
