@@ -71,7 +71,7 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 2. **Dedup check FIRST** — reads `tokenIdForPost(statusId)` on the shared contract. If it's nonzero, the post is already minted: the script emits `alreadyMinted: true`, the minter address, and the OpenSea token link. NO transaction is built. (Follow OUTPUT CONTRACT path B.)
 3. If not yet minted: resolves the tweet (text, author, first image) via the fxtwitter API — no X API keys needed.
 4. If the tweet has no image but quotes a tweet that DOES, it uses the quoted tweet's image.
-5. If NO image is found anywhere, it uses a rendered screenshot of the tweet itself (thum.io) as the image, so every NFT has a visual.
+5. If NO image is found anywhere, it uses a rendered screenshot of the tweet itself (thum.io), cropped to zoom into the post card, so every NFT has a visual.
 6. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved image, external_url = tweet URL.
 7. Builds a single `mintPost(postId, tokenURI)` transaction to the shared contract `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. `postId` = the target tweet's status ID. The NFT is minted to `msg.sender` (the tweeting user).
 8. After the mint confirms, report per OUTPUT CONTRACT path A (Basescan token link + tx + Bankr-terminal note).
@@ -160,8 +160,12 @@ let all = (t.media && Array.isArray(t.media.all)) ? t.media.all : [];
 if (!all.length && t.quote && t.quote.media && Array.isArray(t.quote.media.all)) all = t.quote.media.all;
 let image = all.find(m => m.type === 'photo')?.url || null;
 if (!image) {
-  // Plain width-only thum.io URL. Do NOT add crop/noanimate or URL-encode — that returns HTTP 400.
-  image = `https://image.thum.io/get/width/1200/${tweetUrl}`;
+  // Text-only fallback: rendered screenshot zoomed into the post card.
+  // Use the UNENCODED width/crop form: `width/600/crop/800/<tweetUrl>` — verified HTTP 200 + real image/png.
+  // Do NOT URL-encode the tweet URL and do NOT use viewportWidth/noanimate variants — those return an
+  // image/gif loading-placeholder (dead image) or HTTP 400. Plain width/1200 works too but screenshots the
+  // whole page (too zoomed out); width/600/crop/800 frames just the tweet.
+  image = `https://image.thum.io/get/width/600/crop/800/${tweetUrl}`;
 }
 
 const tokenMeta = { name: `Post by @${author}`, description: `${t.text || ''}\n\n${tweetUrl}`, image, external_url: tweetUrl };
@@ -221,8 +225,8 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **Reply & quote context first.** "mint this for me" as a reply means mint the PARENT; as a quote tweet means mint the QUOTED tweet. Pass the user's own tweet ID as `REPLY_ID`; the script follows `replying_to_status` (reply) then `quote.id` (QT). Only ask for a URL if there is genuinely no resolvable target.
 - **Do not change the collection name/description strings** ("Postmint" / "Posts minted via Bankr") — they are set on-chain by the contract owner, not per mint. The build script no longer sets collection metadata.
 - **The tweet must be public.** Protected/deleted tweets (including an unavailable PARENT or QUOTED tweet) fail at the fxtwitter step with a clear error.
-- Videos are not supported; the first photo is used. Text-only tweets use a rendered screenshot.
-- **Screenshot URL gotcha:** use the plain width-only form `https://image.thum.io/get/width/1200/<tweetUrl>` (NOT URL-encoded, no `crop/`/`noanimate/`). The crop/noanimate + encoded form returns HTTP 400 and bakes a dead image into the NFT.
+- Videos are not supported; the first photo is used. Text-only tweets use a rendered screenshot cropped to the post card.
+- **Screenshot URL gotcha:** for text-only tweets use the UNENCODED width/crop form `https://image.thum.io/get/width/600/crop/800/<tweetUrl>`. This is verified to return HTTP 200 + a real `image/png`, and it frames just the tweet card (zoomed in) instead of the whole page. Do NOT URL-encode the tweet URL, and do NOT use the `viewportWidth/.../crop/...` or `publish.twitter.com/oembed` variants — those return an `image/gif` loading-placeholder (a dead image baked into the NFT). The plain `width/1200/<tweetUrl>` form also returns a valid image but screenshots the entire page (too zoomed out) — that was the old behavior and is why token images looked like a full-screen capture.
 - **Royalties:** 5% ERC-2981 to the collection owner, set on-chain. Not something the skill or minter controls per token.
 
 ## Troubleshooting
@@ -232,6 +236,8 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **Agent asks "which post?" when the user was replying to / quoting a tweet:** the agent didn't pass `REPLY_ID`. Hand the build script the user's OWN tweet ID as `REPLY_ID`; it resolves `replying_to_status` (reply) or `quote.id` (QT).
 - **`That tweet is neither a reply nor a quote tweet`:** `REPLY_ID` pointed at a top-level tweet. Ask for the target URL.
 - **`parent/quoted may be protected/deleted`:** the target tweet is unavailable via fxtwitter. Nothing to mint; tell the user the original post isn't publicly accessible.
+- **Text-only NFT image looks like a full-screen capture:** the old `width/1200/<tweetUrl>` full-page form was used. The current script uses `width/600/crop/800/<tweetUrl>` to zoom into the post card. (Already-minted tokens can't be changed — metadata is immutable on-chain base64 and the contract has no per-token setURI; this only affects mints going forward.)
+- **Text-only NFT image is a blank/loading gif:** an encoded URL or a `viewportWidth`/`publish.twitter` variant was used — those return `image/gif` placeholders. Use the exact unencoded `width/600/crop/800/<tweetUrl>` form.
 - **Response shows Zora / wrong links on a fresh mint:** the agent ignored OUTPUT CONTRACT path A. Report ONLY the Basescan token link + basescan tx + the Bankr-terminal note.
 - **"skill installed but errored loading" → fell back to Club-gated search:** RETRY loading the skill directly (`use_skill`/`use_skill_file`) and act on the trigger. Never route through `search_skills` (Club-gated).
 
