@@ -1,6 +1,6 @@
 ---
 name: postmint
-description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE shared "Postmint" collection. Trigger phrases include "postmint this", "mint this post", "mint this tweet", "mint this for me", "turn this post into an NFT", or providing an x.com/twitter.com status URL and asking to mint it. Works on replies (mints the parent tweet) and quote tweets (mints the quoted tweet) with no URL needed. Given a target, the agent fetches the post's image + text (or the quoted tweet's image, or a rendered screenshot for text-only posts), builds fully on-chain metadata, and mints it into the shared PostmintShared collection on Base. GIF/video posts use the poster frame as the image and the mp4 as animation_url. The NFT is held by the minter (the tweeting user's own wallet). Every post can be minted ONCE (first-come-first-served, enforced on-chain). If a post is already minted, the agent tells the user who minted it and links the OpenSea token. After a fresh mint, report ONLY the Basescan token link + tx + a note it appears in the Bankr terminal.
+description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE shared "Postmint" collection. Trigger phrases include "postmint this", "mint this post", "mint this tweet", "mint this for me", "turn this post into an NFT", or providing an x.com/twitter.com status URL and asking to mint it. Works on replies (mints the parent tweet) and quote tweets (mints the quoted tweet) with no URL needed. Given a target, the agent fetches the post's image + text (or the quoted tweet's image, or renders a tight on-chain SVG tweet-card for text-only posts), builds fully on-chain metadata, and mints it into the shared PostmintShared collection on Base. GIF/video posts use the poster frame as the image and the mp4 as animation_url. The NFT is held by the minter (the tweeting user's own wallet). Every post can be minted ONCE (first-come-first-served, enforced on-chain). If a post is already minted, the agent tells the user who minted it and links the OpenSea token. After a fresh mint, report ONLY the Basescan token link + tx + a note it appears in the Bankr terminal.
 ---
 
 # Postmint
@@ -74,12 +74,12 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 1. Resolves the target tweet. If `REPLY_ID` is given (and no `TWEET_URL`), it fetches the user's tweet and follows `replying_to_status` (reply parent) or `quote.id` (quoted tweet) to the actual post being minted.
 2. **Dedup check FIRST** — reads `tokenIdForPost(statusId)` on the shared contract. If it's nonzero, the post is already minted: the script emits `alreadyMinted: true`, the minter address, and the OpenSea token link. NO transaction is built. (Follow OUTPUT CONTRACT path B.)
 3. If not yet minted: resolves the tweet (text, author, media) via the fxtwitter API — no X API keys needed.
-4. **Media resolution (photo → gif/video → quoted-tweet media → screenshot):**
+4. **Media resolution (photo → gif/video → quoted-tweet media → rendered SVG tweet-card):**
    - If the tweet has a **photo**, use it as `image`.
    - If the tweet has a **gif or video** (no photo), use the media's `thumbnail_url` (poster frame) as `image` AND set `animation_url` to the best mp4 variant so marketplaces play the motion. (Twitter "gifs" are mp4 videos — same handling.)
    - If the tweet itself has no usable media but **quotes a tweet that does**, use the quoted tweet's photo, or its gif/video poster + mp4.
-   - If NO media is found anywhere, use a rendered screenshot of the tweet (thum.io), cropped to zoom into the post card, so every NFT still has a visual.
-5. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved poster/photo/screenshot, `animation_url` = mp4 (only when a gif/video was found), external_url = tweet URL.
+   - If NO media is found anywhere (**text-only post**), the script RENDERS a tight tweet-card as an **SVG built from a string** (no headless browser) — sender avatar (embedded as a base64 data URI) + display name + @handle + the tweet text word-wrapped, and the date. The SVG is a fixed 600px wide and its HEIGHT is computed from the wrapped line count, so the card auto-fits any tweet length — no whitespace padding on short tweets, no chopped lines on long ones. It's embedded fully on-chain as a `data:image/svg+xml;base64` URI (no external image host, nothing to rot). This REPLACES the old thum.io screenshot, which captured the whole page and often baked in an `image/gif` loading placeholder.
+5. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved photo / poster / on-chain SVG card, `animation_url` = mp4 (only when a gif/video was found), external_url = tweet URL.
 6. Builds a single `mintPost(postId, tokenURI)` transaction to the shared contract `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. `postId` = the target tweet's status ID. The NFT is minted to `msg.sender` (the tweeting user).
 7. After the mint confirms, report per OUTPUT CONTRACT path A (Basescan token link + tx + Bankr-terminal note).
 
@@ -96,7 +96,7 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 Run this script with `execute_cli` (packages: `["viem@2.21.0"]`, run with `bun build-mint.js`). Set `WALLET` and ONE of `TWEET_URL` / `REPLY_ID` via env. It prints either an `alreadyMinted:true` result (path B) or a JSON transaction to submit plus the links to report (path A).
 
 ```javascript
-// build-mint.js — Postmint v4 (shared contract)
+// build-mint.js — Postmint v5 (shared contract; on-chain SVG card for text-only posts)
 import { createPublicClient, http, encodeFunctionData } from 'viem';
 import { base } from 'viem/chains';
 
@@ -151,6 +151,68 @@ function resolveMedia(all) {
   return { image: null, animationUrl: null };
 }
 
+// ---- On-chain SVG tweet-card renderer (text-only posts) ----
+// Pure string SVG (NO headless browser — Chromium won't run in the sandbox). Height auto-fits the
+// wrapped tweet text so short tweets have no padding and long tweets aren't chopped. Avatar is fetched
+// and embedded as a base64 data URI so the whole card lives on-chain with zero external dependencies.
+const xmlEsc = (s) => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+async function avatarDataUri(url) {
+  try {
+    if (!url) return null;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const ct = r.headers.get('content-type') || 'image/jpeg';
+    const b = Buffer.from(await r.arrayBuffer());
+    if (b.length > 400000) return null; // keep tokenURI reasonable; fall back to placeholder circle
+    return `data:${ct};base64,${b.toString('base64')}`;
+  } catch { return null; }
+}
+// Greedy word-wrap by approx chars-per-line for the given width/font-size. Preserves hard newlines.
+function wrapText(text, maxChars) {
+  const lines = [];
+  for (const para of String(text || '').replace(/\r/g,'').split('\n')) {
+    let cur = '';
+    for (const w of para.split(/\s+/).filter(Boolean)) {
+      if ((cur + ' ' + w).trim().length <= maxChars) { cur = (cur ? cur + ' ' : '') + w; }
+      else {
+        if (cur) lines.push(cur);
+        if (w.length > maxChars) { let s = w; while (s.length > maxChars) { lines.push(s.slice(0, maxChars)); s = s.slice(maxChars); } cur = s; }
+        else cur = w;
+      }
+    }
+    lines.push(cur); // keep blank lines between paragraphs
+  }
+  return lines.length ? lines : [''];
+}
+function buildCardSvg(t, avatarUri) {
+  const W = 600, PAD = 32, AV = 56, fontSize = 26, lineH = 36;
+  const name = xmlEsc(t.author?.name || t.author?.screen_name || '');
+  const handle = xmlEsc('@' + (t.author?.screen_name || ''));
+  const dt = t.created_at ? new Date(t.created_at).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '';
+  const maxChars = Math.floor((W - PAD * 2) / (fontSize * 0.52)); // empirical avg glyph width
+  const lines = wrapText(t.text || '', maxChars);
+  const headerH = PAD + AV + 20;             // top pad + avatar + gap
+  const H = headerH + lines.length * lineH + PAD + 28; // + text block + date + bottom pad
+  const cx = PAD + AV / 2;
+  const avatarEl = avatarUri
+    ? `<clipPath id="c"><circle cx="${cx}" cy="${cx}" r="${AV/2}"/></clipPath><image href="${avatarUri}" x="${PAD}" y="${PAD}" width="${AV}" height="${AV}" clip-path="url(#c)" preserveAspectRatio="xMidYMid slice"/>`
+    : `<circle cx="${cx}" cy="${cx}" r="${AV/2}" fill="#38444d"/>`;
+  const nameX = PAD + AV + 16;
+  const textStart = headerH + lineH - 6;
+  const textEls = lines.map((ln, i) =>
+    `<text x="${PAD}" y="${textStart + i * lineH}" fill="#e7e9ea" font-size="${fontSize}" font-family="Helvetica,Arial,sans-serif">${xmlEsc(ln)}</text>`).join('');
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
+    `<rect width="${W}" height="${H}" fill="#15202b"/>` +
+    avatarEl +
+    `<text x="${nameX}" y="${PAD+22}" fill="#ffffff" font-size="22" font-weight="bold" font-family="Helvetica,Arial,sans-serif">${name}</text>` +
+    `<text x="${nameX}" y="${PAD+46}" fill="#8899a6" font-size="18" font-family="Helvetica,Arial,sans-serif">${handle}</text>` +
+    textEls +
+    `<text x="${PAD}" y="${H-PAD+4}" fill="#8899a6" font-size="15" font-family="Helvetica,Arial,sans-serif">${xmlEsc(dt)}</text>` +
+    `</svg>`;
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
+}
+
 // --- Resolve the target status id ---
 let statusId = null, resolvedFrom = null;
 if (TWEET_URL) {
@@ -191,18 +253,18 @@ if (!t) throw new Error('Target tweet not found or not public (parent/quoted may
 const author = t.author?.screen_name || 'unknown';
 const tweetUrl = t.url || `https://x.com/i/status/${statusId}`;
 
-// Media: photo -> gif/video poster+mp4 -> quoted tweet's media -> screenshot fallback.
+// Media: photo -> gif/video poster+mp4 -> quoted tweet's media -> on-chain SVG card (text-only).
 let { image, animationUrl } = resolveMedia(t.media && t.media.all);
 if (!image && !animationUrl && t.quote && t.quote.media && Array.isArray(t.quote.media.all)) {
   ({ image, animationUrl } = resolveMedia(t.quote.media.all));
 }
+let imageKind = image ? 'media' : null;
 if (!image) {
-  // Text-only fallback: rendered screenshot zoomed into the post card.
-  // Use the UNENCODED width/crop form: `width/600/crop/800/<tweetUrl>` — verified HTTP 200 + real image/png.
-  // Do NOT URL-encode the tweet URL and do NOT use viewportWidth/noanimate variants — those return an
-  // image/gif loading-placeholder (dead image) or HTTP 400. Plain width/1200 works too but screenshots the
-  // whole page (too zoomed out); width/600/crop/800 frames just the tweet.
-  image = `https://image.thum.io/get/width/600/crop/800/${tweetUrl}`;
+  // Text-only fallback: render a tight tweet-card SVG (avatar + header + wrapped text), fully on-chain.
+  // Auto-fits height to the wrapped line count -> no whitespace bleed, no chopped lines, any tweet length.
+  const av = await avatarDataUri(t.author?.avatar_url);
+  image = buildCardSvg(t, av);
+  imageKind = av ? 'svg-card' : 'svg-card(no-avatar)';
 }
 
 const tokenMeta = { name: `Post by @${author}`, description: `${t.text || ''}\n\n${tweetUrl}`, image, external_url: tweetUrl };
@@ -233,7 +295,7 @@ console.log(JSON.stringify({
   resolvedFrom,
   // Report ONLY the Basescan link on the fresh-mint path.
   explorerLink: `https://basescan.org/token/${CONTRACT}`,
-  preview: { name: tokenMeta.name, image, animationUrl: animationUrl || null, tweetUrl },
+  preview: { name: tokenMeta.name, imageKind, animationUrl: animationUrl || null, tweetUrl },
 }, null, 2));
 ```
 
@@ -302,8 +364,8 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **Reply & quote context first.** "mint this for me" as a reply means mint the PARENT; as a quote tweet means mint the QUOTED tweet. Pass the user's own tweet ID as `REPLY_ID`; the script follows `replying_to_status` (reply) then `quote.id` (QT). Only ask for a URL if there is genuinely no resolvable target.
 - **Do not change the collection name/description strings** ("Postmint" / "Posts minted via Bankr") — they are set on-chain by the contract owner, not per mint. The build script no longer sets collection metadata.
 - **The tweet must be public.** Protected/deleted tweets (including an unavailable PARENT or QUOTED tweet) fail at the fxtwitter step with a clear error.
-- **GIF & video ARE supported.** For a gif/video post, the NFT's `image` is the poster frame (thumbnail) and `animation_url` is the best mp4 variant, so OpenSea and most marketplaces play the motion while using the poster as the thumbnail. The mp4 stays hosted on Twitter's CDN — if that link ever rots, motion stops but the on-chain poster image and metadata survive. Embedding the video bytes on-chain is intentionally NOT done (far too large/expensive). Videos with no resolvable poster fall back to the screenshot image. The first/primary media item is used when a post has several.
-- **Screenshot URL gotcha (text-only posts):** use the UNENCODED width/crop form `https://image.thum.io/get/width/600/crop/800/<tweetUrl>`. This is verified to return HTTP 200 + a real `image/png`, and it frames just the tweet card (zoomed in) instead of the whole page. Do NOT URL-encode the tweet URL, and do NOT use the `viewportWidth/.../crop/...` or `publish.twitter.com/oembed` variants — those return an `image/gif` loading-placeholder (a dead image baked into the NFT). The plain `width/1200/<tweetUrl>` form also returns a valid image but screenshots the entire page (too zoomed out) — that was the old behavior and is why token images looked like a full-screen capture.
+- **GIF & video ARE supported.** For a gif/video post, the NFT's `image` is the poster frame (thumbnail) and `animation_url` is the best mp4 variant, so OpenSea and most marketplaces play the motion while using the poster as the thumbnail. The mp4 stays hosted on Twitter's CDN — if that link ever rots, motion stops but the on-chain poster image and metadata survive. Embedding the video bytes on-chain is intentionally NOT done (far too large/expensive). Videos with no resolvable poster fall back to the on-chain SVG tweet-card. The first/primary media item is used when a post has several.
+- **Text-only posts render a tight on-chain SVG tweet-card.** No media anywhere → the script builds an SVG card (600px wide, height auto-computed from the wrapped line count) containing the sender avatar (embedded base64 data URI), display name, @handle, the word-wrapped tweet text, and the date, and embeds it as a `data:image/svg+xml;base64` URI. This is FULLY on-chain — no external image host, nothing to rot — and it frames just the tweet, so short tweets have no whitespace padding and long tweets are never chopped. Verified: renders to a valid raster (600×204 for a short tweet, taller as text grows) and includes the avatar. This REPLACED the old thum.io screenshot fallback, which captured the whole x.com page and frequently baked in an `image/gif` loading-placeholder (a dead image). If the avatar can't be fetched (or is >400KB), the card draws a neutral placeholder circle instead — the text card still renders.
 - **Royalties:** 5% ERC-2981 to the collection owner, set on-chain. Not something the skill or minter controls per token.
 
 ## Troubleshooting
@@ -314,11 +376,12 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **`That tweet is neither a reply nor a quote tweet`:** `REPLY_ID` pointed at a top-level tweet. Ask for the target URL.
 - **`parent/quoted may be protected/deleted`:** the target tweet is unavailable via fxtwitter. Nothing to mint; tell the user the original post isn't publicly accessible.
 - **GIF/video NFT shows only a still, no motion:** the marketplace doesn't render `animation_url`, or the mp4 CDN link expired. The poster `image` always renders; motion depends on the marketplace + a live Twitter CDN mp4. Nothing to fix on-chain — metadata is immutable.
-- **GIF/video NFT has no image at all:** the media had no resolvable `thumbnail_url`/poster; the script then falls back to the thum.io screenshot. If you see a blank, re-run — a transient fxtwitter response may have lacked the poster field.
-- **Text-only NFT image looks like a full-screen capture:** the old `width/1200/<tweetUrl>` full-page form was used. The current script uses `width/600/crop/800/<tweetUrl>` to zoom into the post card. (Already-minted tokens can't be changed — metadata is immutable on-chain base64 and the contract has no per-token setURI; this only affects mints going forward.)
-- **Text-only NFT image is a blank/loading gif:** an encoded URL or a `viewportWidth`/`publish.twitter` variant was used — those return `image/gif` placeholders. Use the exact unencoded `width/600/crop/800/<tweetUrl>` form.
+- **GIF/video NFT has no image at all:** the media had no resolvable `thumbnail_url`/poster; the script then falls back to the on-chain SVG tweet-card. If you see a blank, re-run — a transient fxtwitter response may have lacked the poster field.
+- **Text-only NFT image looks like a full-screen screenshot / has whitespace or a blank loading gif:** that is the OLD thum.io behavior. The current script renders an on-chain SVG tweet-card instead (tight crop, avatar included, auto-fit height). If you still see a screenshot-style image on a NEW mint, the agent is running an outdated build-mint.js — use the version in this SKILL.md. Already-minted tokens can't be changed (metadata is immutable on-chain base64 and the contract has no per-token setURI); this only affects mints going forward.
+- **Text-only SVG card is missing the avatar (shows a plain circle):** the avatar fetch failed or the image exceeded the 400KB embed cap, so the card drew a placeholder circle. The text, name, handle, and date still render. Re-run to retry the avatar fetch if a transient failure is suspected.
+- **Text-only SVG card text looks cramped or overflows the card width:** the greedy word-wrap uses an empirical avg glyph width (`fontSize * 0.52`) to pick chars-per-line. Very wide glyphs can nudge a line slightly; it does not chop text (height grows to fit). If you want a safer margin, lower the `0.52` factor in `wrapText`'s `maxChars` calc.
 - **Response shows Zora / wrong links on a fresh mint:** the agent ignored OUTPUT CONTRACT path A. Report ONLY the Basescan token link + basescan tx + the Bankr-terminal note.
 - **"skill installed but errored loading" → fell back to Club-gated search:** RETRY loading the skill directly (`use_skill`/`use_skill_file`) and act on the trigger. Never route through `search_skills` (Club-gated).
 
 ---
-**This skill uses shell commands.** If `execute_cli`, `tail_cli`, `get_cli_task_output`, `kill_cli_task`, or `send_interim_message` are not in your bound tool list, call `request_additional_tools` with the query "execute_cli tail_cli get_cli_task_output kill_cli_task send_interim_message" BEFORE running any commands. Sandbox install rules: do not run `npm install -g`; put npm packages in `execute_cli.packages` and invoke binaries from PATH or `node_modules/.bin`.
+**This skill uses shell commands.** If `execute_cli`, `tail_cli`, `get_cli_task_output`, `kill_cli_task`, or `send_interim_message` are not in your bound tool list, call `request_additional_tools` with the query "execute_cli tail_cli get_cli_task_output kill_cli_task send_interim_message" BEFORE running any commands. Sandbox install rules: do not run `npm install -g`; put npm packages in `execute_cli.packages` and invoke binaries from PATH or `node_modules/.bin`. Note: headless Chromium (Playwright/Puppeteer) does NOT run in the sandbox (missing system libs) — this is why the text-only card is rendered as a pure-string SVG, not a browser screenshot.
