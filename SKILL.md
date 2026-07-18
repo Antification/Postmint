@@ -1,6 +1,6 @@
 ---
 name: postmint
-description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE shared "Postmint" collection. Trigger phrases include "postmint this", "mint this post", "mint this tweet", "mint this for me", "turn this post into an NFT", or providing an x.com/twitter.com status URL and asking to mint it. Works on replies (mints the parent tweet) and quote tweets (mints the quoted tweet) with no URL needed. Given a target, the agent fetches the post's image + text (or the quoted tweet's image, or a rendered screenshot for text-only posts), builds fully on-chain metadata, and mints it into the shared PostmintShared collection on Base. The NFT is held by the minter (the tweeting user's own wallet). Every post can be minted ONCE (first-come-first-served, enforced on-chain). If a post is already minted, the agent tells the user who minted it and links the OpenSea token. After a fresh mint, report ONLY the Basescan token link + tx + a note it appears in the Bankr terminal.
+description: Mint any public X/Twitter post as an ERC-1155 NFT on Base into ONE shared "Postmint" collection. Trigger phrases include "postmint this", "mint this post", "mint this tweet", "mint this for me", "turn this post into an NFT", or providing an x.com/twitter.com status URL and asking to mint it. Works on replies (mints the parent tweet) and quote tweets (mints the quoted tweet) with no URL needed. Given a target, the agent fetches the post's image + text (or the quoted tweet's image, or a rendered screenshot for text-only posts), builds fully on-chain metadata, and mints it into the shared PostmintShared collection on Base. GIF/video posts use the poster frame as the image and the mp4 as animation_url. The NFT is held by the minter (the tweeting user's own wallet). Every post can be minted ONCE (first-come-first-served, enforced on-chain). If a post is already minted, the agent tells the user who minted it and links the OpenSea token. After a fresh mint, report ONLY the Basescan token link + tx + a note it appears in the Bankr terminal.
 ---
 
 # Postmint
@@ -69,12 +69,15 @@ Priority: explicit URL in message → reply parent → quoted tweet → ask the 
 
 1. Resolves the target tweet. If `REPLY_ID` is given (and no `TWEET_URL`), it fetches the user's tweet and follows `replying_to_status` (reply parent) or `quote.id` (quoted tweet) to the actual post being minted.
 2. **Dedup check FIRST** — reads `tokenIdForPost(statusId)` on the shared contract. If it's nonzero, the post is already minted: the script emits `alreadyMinted: true`, the minter address, and the OpenSea token link. NO transaction is built. (Follow OUTPUT CONTRACT path B.)
-3. If not yet minted: resolves the tweet (text, author, first image) via the fxtwitter API — no X API keys needed.
-4. If the tweet has no image but quotes a tweet that DOES, it uses the quoted tweet's image.
-5. If NO image is found anywhere, it uses a rendered screenshot of the tweet itself (thum.io), cropped to zoom into the post card, so every NFT has a visual.
-6. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved image, external_url = tweet URL.
-7. Builds a single `mintPost(postId, tokenURI)` transaction to the shared contract `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. `postId` = the target tweet's status ID. The NFT is minted to `msg.sender` (the tweeting user).
-8. After the mint confirms, report per OUTPUT CONTRACT path A (Basescan token link + tx + Bankr-terminal note).
+3. If not yet minted: resolves the tweet (text, author, media) via the fxtwitter API — no X API keys needed.
+4. **Media resolution (photo → gif/video → quoted-tweet media → screenshot):**
+   - If the tweet has a **photo**, use it as `image`.
+   - If the tweet has a **gif or video** (no photo), use the media's `thumbnail_url` (poster frame) as `image` AND set `animation_url` to the best mp4 variant so marketplaces play the motion. (Twitter "gifs" are mp4 videos — same handling.)
+   - If the tweet itself has no usable media but **quotes a tweet that does**, use the quoted tweet's photo, or its gif/video poster + mp4.
+   - If NO media is found anywhere, use a rendered screenshot of the tweet (thum.io), cropped to zoom into the post card, so every NFT still has a visual.
+5. Builds token metadata: name `Post by @<author>`, description = tweet text + source URL, image = the resolved poster/photo/screenshot, `animation_url` = mp4 (only when a gif/video was found), external_url = tweet URL.
+6. Builds a single `mintPost(postId, tokenURI)` transaction to the shared contract `0xFF8f2e1717C897717CaaeB1fA987876c4059d9A1`. `postId` = the target tweet's status ID. The NFT is minted to `msg.sender` (the tweeting user).
+7. After the mint confirms, report per OUTPUT CONTRACT path A (Basescan token link + tx + Bankr-terminal note).
 
 ## Requirements
 
@@ -116,6 +119,34 @@ const idFrom = (s) => (String(s || '').match(/status(?:es)?\/(\d+)/) || [])[1] |
 const fetchTweet = async (id) => { const r = await fetch(`https://api.fxtwitter.com/status/${id}`); const j = await r.json(); return j.tweet || null; };
 async function readC(fn, args = []) { let e; for (const u of RPCS) { try { const c = createPublicClient({ chain: base, transport: http(u) }); return await c.readContract({ address: CONTRACT, abi, functionName: fn, args }); } catch (x) { e = x; } } throw e; }
 
+// Pick the best mp4 variant URL from a gif/video media object (fxtwitter shape).
+function bestMp4(m) {
+  if (!m) return null;
+  // fxtwitter video media exposes `.url` (direct mp4) and sometimes `.variants[]` with bitrate.
+  if (Array.isArray(m.variants) && m.variants.length) {
+    const mp4s = m.variants.filter(v => (v.content_type || v.type || '').includes('mp4') || /\.mp4/.test(v.url || ''));
+    const pool = mp4s.length ? mp4s : m.variants;
+    pool.sort((a, b) => (Number(b.bitrate || 0)) - (Number(a.bitrate || 0)));
+    if (pool[0] && pool[0].url) return pool[0].url;
+  }
+  if (m.url && /\.mp4/.test(m.url)) return m.url;
+  return m.url || null;
+}
+
+// Resolve media from a media.all array: returns { image, animationUrl }.
+function resolveMedia(all) {
+  if (!Array.isArray(all) || !all.length) return { image: null, animationUrl: null };
+  const photo = all.find(m => m.type === 'photo');
+  if (photo && photo.url) return { image: photo.url, animationUrl: null };
+  const vid = all.find(m => m.type === 'video' || m.type === 'gif');
+  if (vid) {
+    const poster = vid.thumbnail_url || vid.poster || vid.preview_image_url || null;
+    const mp4 = bestMp4(vid);
+    return { image: poster, animationUrl: mp4 };
+  }
+  return { image: null, animationUrl: null };
+}
+
 // --- Resolve the target status id ---
 let statusId = null, resolvedFrom = null;
 if (TWEET_URL) {
@@ -156,9 +187,11 @@ if (!t) throw new Error('Target tweet not found or not public (parent/quoted may
 const author = t.author?.screen_name || 'unknown';
 const tweetUrl = t.url || `https://x.com/i/status/${statusId}`;
 
-let all = (t.media && Array.isArray(t.media.all)) ? t.media.all : [];
-if (!all.length && t.quote && t.quote.media && Array.isArray(t.quote.media.all)) all = t.quote.media.all;
-let image = all.find(m => m.type === 'photo')?.url || null;
+// Media: photo -> gif/video poster+mp4 -> quoted tweet's media -> screenshot fallback.
+let { image, animationUrl } = resolveMedia(t.media && t.media.all);
+if (!image && !animationUrl && t.quote && t.quote.media && Array.isArray(t.quote.media.all)) {
+  ({ image, animationUrl } = resolveMedia(t.quote.media.all));
+}
 if (!image) {
   // Text-only fallback: rendered screenshot zoomed into the post card.
   // Use the UNENCODED width/crop form: `width/600/crop/800/<tweetUrl>` — verified HTTP 200 + real image/png.
@@ -169,6 +202,7 @@ if (!image) {
 }
 
 const tokenMeta = { name: `Post by @${author}`, description: `${t.text || ''}\n\n${tweetUrl}`, image, external_url: tweetUrl };
+if (animationUrl) tokenMeta.animation_url = animationUrl; // motion for gif/video; poster stays as `image`
 const tokenUri = dataUri(tokenMeta);
 
 const nextId = await readC('nextTokenId');
@@ -182,7 +216,7 @@ console.log(JSON.stringify({
   resolvedFrom,
   // Report ONLY the Basescan link on the fresh-mint path.
   explorerLink: `https://basescan.org/token/${CONTRACT}`,
-  preview: { name: tokenMeta.name, image, tweetUrl },
+  preview: { name: tokenMeta.name, image, animationUrl: animationUrl || null, tweetUrl },
 }, null, 2));
 ```
 
@@ -225,8 +259,8 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **Reply & quote context first.** "mint this for me" as a reply means mint the PARENT; as a quote tweet means mint the QUOTED tweet. Pass the user's own tweet ID as `REPLY_ID`; the script follows `replying_to_status` (reply) then `quote.id` (QT). Only ask for a URL if there is genuinely no resolvable target.
 - **Do not change the collection name/description strings** ("Postmint" / "Posts minted via Bankr") — they are set on-chain by the contract owner, not per mint. The build script no longer sets collection metadata.
 - **The tweet must be public.** Protected/deleted tweets (including an unavailable PARENT or QUOTED tweet) fail at the fxtwitter step with a clear error.
-- Videos are not supported; the first photo is used. Text-only tweets use a rendered screenshot cropped to the post card.
-- **Screenshot URL gotcha:** for text-only tweets use the UNENCODED width/crop form `https://image.thum.io/get/width/600/crop/800/<tweetUrl>`. This is verified to return HTTP 200 + a real `image/png`, and it frames just the tweet card (zoomed in) instead of the whole page. Do NOT URL-encode the tweet URL, and do NOT use the `viewportWidth/.../crop/...` or `publish.twitter.com/oembed` variants — those return an `image/gif` loading-placeholder (a dead image baked into the NFT). The plain `width/1200/<tweetUrl>` form also returns a valid image but screenshots the entire page (too zoomed out) — that was the old behavior and is why token images looked like a full-screen capture.
+- **GIF & video ARE supported.** For a gif/video post, the NFT's `image` is the poster frame (thumbnail) and `animation_url` is the best mp4 variant, so OpenSea and most marketplaces play the motion while using the poster as the thumbnail. The mp4 stays hosted on Twitter's CDN — if that link ever rots, motion stops but the on-chain poster image and metadata survive. Embedding the video bytes on-chain is intentionally NOT done (far too large/expensive). Videos with no resolvable poster fall back to the screenshot image. The first/primary media item is used when a post has several.
+- **Screenshot URL gotcha (text-only posts):** use the UNENCODED width/crop form `https://image.thum.io/get/width/600/crop/800/<tweetUrl>`. This is verified to return HTTP 200 + a real `image/png`, and it frames just the tweet card (zoomed in) instead of the whole page. Do NOT URL-encode the tweet URL, and do NOT use the `viewportWidth/.../crop/...` or `publish.twitter.com/oembed` variants — those return an `image/gif` loading-placeholder (a dead image baked into the NFT). The plain `width/1200/<tweetUrl>` form also returns a valid image but screenshots the entire page (too zoomed out) — that was the old behavior and is why token images looked like a full-screen capture.
 - **Royalties:** 5% ERC-2981 to the collection owner, set on-chain. Not something the skill or minter controls per token.
 
 ## Troubleshooting
@@ -236,6 +270,8 @@ Use `<openseaCollection>` if only the collection link is present. OpenSea IS all
 - **Agent asks "which post?" when the user was replying to / quoting a tweet:** the agent didn't pass `REPLY_ID`. Hand the build script the user's OWN tweet ID as `REPLY_ID`; it resolves `replying_to_status` (reply) or `quote.id` (QT).
 - **`That tweet is neither a reply nor a quote tweet`:** `REPLY_ID` pointed at a top-level tweet. Ask for the target URL.
 - **`parent/quoted may be protected/deleted`:** the target tweet is unavailable via fxtwitter. Nothing to mint; tell the user the original post isn't publicly accessible.
+- **GIF/video NFT shows only a still, no motion:** the marketplace doesn't render `animation_url`, or the mp4 CDN link expired. The poster `image` always renders; motion depends on the marketplace + a live Twitter CDN mp4. Nothing to fix on-chain — metadata is immutable.
+- **GIF/video NFT has no image at all:** the media had no resolvable `thumbnail_url`/poster; the script then falls back to the thum.io screenshot. If you see a blank, re-run — a transient fxtwitter response may have lacked the poster field.
 - **Text-only NFT image looks like a full-screen capture:** the old `width/1200/<tweetUrl>` full-page form was used. The current script uses `width/600/crop/800/<tweetUrl>` to zoom into the post card. (Already-minted tokens can't be changed — metadata is immutable on-chain base64 and the contract has no per-token setURI; this only affects mints going forward.)
 - **Text-only NFT image is a blank/loading gif:** an encoded URL or a `viewportWidth`/`publish.twitter` variant was used — those return `image/gif` placeholders. Use the exact unencoded `width/600/crop/800/<tweetUrl>` form.
 - **Response shows Zora / wrong links on a fresh mint:** the agent ignored OUTPUT CONTRACT path A. Report ONLY the Basescan token link + basescan tx + the Bankr-terminal note.
